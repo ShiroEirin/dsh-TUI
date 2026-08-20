@@ -1,6 +1,8 @@
 import React from 'react'
-import { Box, Text } from '../../ui.js'
+import { Box, Text, useTerminalSize } from '../../ui.js'
 import { POINTER } from '../../cc/figures.js'
+import { stringWidth } from '../../ink/stringWidth.js'
+import { wrapWidth } from '../../sessions/format.js'
 
 type Props = {
   text: string
@@ -22,6 +24,16 @@ export function UserPromptMessage({
   isSelected = false,
   onClick,
 }: Props): React.ReactNode {
+  const { columns } = useTerminalSize()
+  const promptPrefix = `${POINTER} `
+  const prefixWidth = stringWidth(promptPrefix)
+  // Wrap in the app so explicit and automatic continuations share a hanging
+  // indent. Ink's own wrap would restart continuation rows at column zero.
+  // Keep a safety margin for the ScrollBox edge/scrollbar and disable a second
+  // wrap on each rendered row below.
+  const lines = wrapWidth(text, Math.max(1, columns - prefixWidth - 3))
+  const continuationIndent = ' '.repeat(prefixWidth)
+
   return (
     <Box
       flexDirection="column"
@@ -30,9 +42,12 @@ export function UserPromptMessage({
       paddingRight={1}
       onClick={onClick}
     >
-      <Text color="briefLabelYou" bold>
-        {POINTER} {text}
-      </Text>
+      {lines.map((line, index) => (
+        <Text key={index} color="briefLabelYou" bold wrap="truncate-end">
+          {index === 0 ? promptPrefix : continuationIndent}
+          {line}
+        </Text>
+      ))}
     </Box>
   )
 }
