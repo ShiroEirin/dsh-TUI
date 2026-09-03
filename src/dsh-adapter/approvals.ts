@@ -88,9 +88,24 @@ const COMMAND_CLIP = 500
  * @returns The `command` argument when present, else the raw arguments
  *   string (clipped), else undefined when the call cannot be found.
  */
+/**
+ * dsh 0.1.2-rc.1 seam: read a live session's events through the rc.1+
+ * snapshotEvents() method, falling back to the legacy `events` getter on
+ * older host lines (the vendored devDependency types still describe it).
+ */
+function sessionEventsOf(session: {
+  snapshotEvents?(): readonly { type: string; data: unknown }[]
+  readonly events?: readonly { type: string; data: unknown }[]
+}): readonly { type: string; data: unknown }[] {
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return session.events ?? []
+}
+
 function commandOf(req: ApprovalRequest): string | undefined {
   if (req.callId === undefined) return undefined
-  const events = req.agent.session.events
+  // dsh 0.1.2-rc.1 seam: snapshotEvents() replaces the events getter; the
+  // legacy getter stays as a fallback for older host lines.
+  const events = sessionEventsOf(req.agent.session) as readonly SessionEvent[]
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event: SessionEvent = events[i]!
     if (event.type !== 'tool/call') continue
@@ -121,7 +136,8 @@ function commandOf(req: ApprovalRequest): string | undefined {
  */
 function isLiveToolApproval(req: ApprovalRequest): boolean {
   if (req.callId === undefined) return false
-  const events = req.agent.session.events
+  // Same rc.1 snapshot seam as commandOf above.
+  const events = sessionEventsOf(req.agent.session) as readonly SessionEvent[]
   let callIndex = -1
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event: SessionEvent = events[i]!
@@ -287,7 +303,7 @@ export class ApprovalStore {
   private refreshActiveExternal(): void {
     const pending = this.active
     if (pending === undefined || pending.snapshot.external === true) return
-    const events = pending.request.agent.session.events
+    const events = sessionEventsOf(pending.request.agent.session) as readonly SessionEvent[]
     if (events.length === this.externalCheckedAtEvents) return
     this.externalCheckedAtEvents = events.length
     if (isLiveToolApproval(pending.request)) return
@@ -306,8 +322,9 @@ export class ApprovalStore {
    * verdict live→external, so everything else is dropped here; the internal
    * length memo then skips the recheck whenever the event belongs to a
    * different session than the active ask's. The notification the SDK
-   * fires arrives after the event is already in `session.events`, so the
-   * recheck sees the settled result.
+   * fires arrives after the event is already in the session log
+   * (`session.snapshotEvents()` on dsh 0.1.2-rc.1+), so the recheck sees
+   * the settled result.
    * @param event - The appended session event.
    */
   noteSessionEvent(event: SessionEvent): void {

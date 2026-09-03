@@ -84,20 +84,33 @@ export async function composePreset(ctx: Context, requested?: string): Promise<P
 export async function resolvePersistedPreset(ctx: Context, sessionId: SessionId): Promise<string | undefined> {
   const persistence = ctx.get('sessionPersistence') as
     | {
-        load(id: SessionId): Promise<{
-          meta: { agentPreset?: string }
-          events: readonly { type: string; data: unknown }[]
+        // dsh 0.1.2-rc.1 removed SessionPersistence.load()/inspect(); the
+        // read-handle seam (open → h.read(0) → h.header → h.close()) replaces
+        // them. Structural on purpose: the service is resolved from a running
+        // context whose packages may be a version apart from ours.
+        open(id: SessionId, mode: 'read'): Promise<{
+          header: { agentPreset?: string }
+          read(fromSeq: number): Promise<readonly { type: string; data: unknown }[]>
+          close(): Promise<void>
         }>
       }
     | undefined
   if (persistence === undefined) return undefined
+  let handle: Awaited<ReturnType<typeof persistence.open>>
   try {
-    const { meta, events } = await persistence.load(sessionId)
-    return resolveRecordedPreset({ header: meta, events })
+    handle = await persistence.open(sessionId, 'read')
   } catch {
     // A missing/corrupt artifact leaves resume itself to report the failure;
     // the preset lookup must not mask it with a second, misleading error.
     return undefined
+  }
+  try {
+    return resolveRecordedPreset(handle.header, await handle.read(0))
+  } catch {
+    // Same degraded-read contract as the open failure above.
+    return undefined
+  } finally {
+    await handle.close().catch(() => {})
   }
 }
 
@@ -106,14 +119,21 @@ export async function resolvePersistedPreset(ctx: Context, sessionId: SessionId)
  * `agent-preset/selected` wins over the header). Used for fork-style creates
  * (rewind/model switch) and for reading an already-live agent's composition.
  *
- * @param session - The live session (`header` + `events`).
+ * @param session - The live session (`header` + the snapshot seam).
  * @returns The running preset id, or undefined when the log records none.
  */
 export function runningPresetOf(session: {
   header: { agentPreset?: string }
-  events: readonly { type: string; data: unknown }[]
+  /** dsh 0.1.2-rc.1 replaced the events getter with snapshotEvents(); both
+   * shapes are accepted so callers on either host line keep type-checking. */
+  snapshotEvents?(): readonly { type: string; data: unknown }[]
+  readonly events?: readonly { type: string; data: unknown }[]
 }): string | undefined {
-  return resolveRecordedPreset(session)
+  const events =
+    typeof session.snapshotEvents === 'function'
+      ? session.snapshotEvents()
+      : session.events ?? []
+  return resolveRecordedPreset(session.header, events)
 }
 
 /**
@@ -135,20 +155,30 @@ export function runningPresetOf(session: {
 export async function resolvePersistedRoute(ctx: Context, sessionId: SessionId): Promise<ModelRoute | undefined> {
   const persistence = ctx.get('sessionPersistence') as
     | {
-        load(id: SessionId): Promise<{
-          meta: unknown
-          events: readonly { type: string; data?: unknown }[]
+        // Same rc.1 read-handle seam as resolvePersistedPreset (see above).
+        open(id: SessionId, mode: 'read'): Promise<{
+          header: unknown
+          read(fromSeq: number): Promise<readonly { type: string; data?: unknown }[]>
+          close(): Promise<void>
         }>
       }
     | undefined
   if (persistence === undefined) return undefined
+  let handle: Awaited<ReturnType<typeof persistence.open>>
   try {
-    const { events } = await persistence.load(sessionId)
-    return recordedModelRoute(events)
+    handle = await persistence.open(sessionId, 'read')
   } catch {
     // A missing/corrupt artifact leaves resume itself to report the failure;
     // the route lookup must not mask it with a second, misleading error.
     return undefined
+  }
+  try {
+    return recordedModelRoute(await handle.read(0))
+  } catch {
+    // Same degraded-read contract as the open failure above.
+    return undefined
+  } finally {
+    await handle.close().catch(() => {})
   }
 }
 

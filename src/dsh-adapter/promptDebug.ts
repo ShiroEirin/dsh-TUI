@@ -50,24 +50,43 @@ interface AgentRegistryLike {
   get(id: NonNullable<GenerateOptions['sessionId']>): Agent | undefined
 }
 
+/**
+ * dsh 0.1.2-rc.1 seam: read a live session's events through the rc.1+
+ * snapshotEvents() method, falling back to the legacy `events` getter on
+ * older host lines (the vendored devDependency types still describe it).
+ */
+function sessionEventsOf(session: {
+  snapshotEvents?(): readonly { type: string; data: unknown }[]
+  readonly events?: readonly { type: string; data: unknown }[]
+}): readonly { type: string; data: unknown }[] {
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return session.events ?? []
+}
+
 function latestPosition(agent: Agent): { turn: number; step: number } | undefined {
-  for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
-    const event = agent.session.events[index]
+  // dsh 0.1.2-rc.1 seam: one snapshot read per call (the events getter was
+  // replaced by the cached snapshotEvents() method).
+  const events = sessionEventsOf(agent.session) as readonly { type: string; data: { turn: number; step: number } }[]
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
     if (event?.type === 'step/start') return event.data
   }
   return undefined
 }
 
 function latestRequestHeaderReason(agent: Agent): string | undefined {
-  for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
-    const event = agent.session.events[index]
+  // Same rc.1 snapshot seam as latestPosition above.
+  const events = sessionEventsOf(agent.session) as readonly { type: string; data: { reason?: string } }[]
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
     if (event?.type === 'request/header') return event.data.reason
   }
   return undefined
 }
 
 function turnCompleted(agent: Agent, turn: number): boolean {
-  return agent.session.events.some(event => event.type === 'turn/end' && event.data.turn === turn)
+  const events = sessionEventsOf(agent.session) as readonly { type: string; data: { turn?: number } }[]
+  return events.some(event => event.type === 'turn/end' && event.data.turn === turn)
 }
 
 function captureRequest(

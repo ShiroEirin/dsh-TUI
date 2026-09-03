@@ -1258,8 +1258,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // the store: it reacts only to tool/result (the sole verdict-flipping
     // event type), and its internal log-length memo skips appends from any
     // session other than the active ask's, so no agent filtering is needed
-    // here. The firehose fires post-commit, after the event entered
-    // session.events, so the recheck sees the settled result.
+    // here. The firehose fires post-commit, after the event entered the
+    // session log (session.snapshotEvents() on dsh 0.1.2-rc.1+), so the
+    // recheck sees the settled result.
     ctx.on('session/event', (_session, event) => approvalStore.noteSessionEvent(event))
     ctx.effect(() => () => approvalStore.settleAll('cancelled'))
   }
@@ -1677,7 +1678,7 @@ async function resolveAgent(
         agent: resumed.agent,
         handle: resumed,
         agentPreset: composed.agentPreset,
-        route: resumeRoute ?? recordedModelRoute(resumed.agent.session.events),
+        route: resumeRoute ?? recordedModelRoute(sessionEventsOf(resumed.agent.session) as readonly { type: string; data: unknown }[]),
       }
     } catch (error) {
       // A launch-time --resume is an explicit request: silently substituting a
@@ -1769,6 +1770,19 @@ export function createExitFunnel(deps: { onUserExit: (error?: unknown) => void }
 }
 
 /**
+ * dsh 0.1.2-rc.1 seam: read a live session's events through the rc.1+
+ * snapshotEvents() method, falling back to the legacy `events` getter on
+ * older host lines (the vendored devDependency types still describe it).
+ */
+function sessionEventsOf(session: {
+  snapshotEvents?(): readonly { type: string; data: unknown }[]
+  readonly events?: readonly { type: string; data: unknown }[]
+}): readonly { type: string; data: unknown }[] {
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return session.events ?? []
+}
+
+/**
  * Whether a user exit should leave the resume marker (and print the resume
  * hint). Must be judged against the LIVE session behind the channel, not the
  * boot-time agent apply() captured: /resume, /new and /model swap the active
@@ -1787,8 +1801,8 @@ export function isExitResumable(deps: {
   const agent = deps.liveAgent ?? deps.startupAgent
   return (
     deps.pendingCount > 0 ||
-    agent.session.events.some(
-      event => event.type === 'user/message' && event.data.source.kind === 'user',
+    sessionEventsOf(agent.session).some(
+      event => event.type === 'user/message' && (event.data as { source?: { kind?: unknown } }).source?.kind === 'user',
     )
   )
 }

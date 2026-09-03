@@ -2,10 +2,10 @@
  * Upstream compatibility contract.
  *
  * The TUI is validated against a set of upstream prerelease lines — the
- * current primary (0.1.2-alpha.2) plus older lines kept in backward
- * compatibility across the 0.1.1 and 0.1.0 release families. Every official
- * package this adapter touches is blessed here; anything else must go
- * through upstream channels or the adapter, never the UI.
+ * current primary (0.1.2-rc.1) plus older lines kept in backward
+ * compatibility across the 0.1.2 alpha, 0.1.1 and 0.1.0 release families.
+ * Every official package this adapter touches is blessed here; anything else
+ * must go through upstream channels or the adapter, never the UI.
  *
  * `upstreamDrift()` powers the CI gate (scripts/verify-upstream-contract.ts)
  * so a mismatched install fails in CI before it fails on a user's machine.
@@ -16,13 +16,15 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 /** Primary validated upstream line (newest). */
-export const UPSTREAM_VALIDATED_VERSION = '0.1.2-alpha.2'
+export const UPSTREAM_VALIDATED_VERSION = '0.1.2-rc.1'
 
 /**
  * Every upstream prerelease line the adapter has been validated against,
  * oldest first.
  *
- * 0.1.2-alpha.2 = primary; 0.1.1-rc.2 and rc.1 are compatibility lines
+ * 0.1.2-rc.1 = primary; 0.1.2-alpha.2 is the compatibility line it grew
+ * from (the snapshotEvents()/read-handle seam is dual-shaped, so alpha.2
+ * hosts keep working); 0.1.1-rc.2 and rc.1 are compatibility lines
  * (install- and type-level compatibility); 0.1.0-rc.8 = previous family
  * (full CI coverage); 0.1.0-rc.7 = full CI coverage as well; 0.1.0-rc.6 =
  * legacy line (install- and type-level compatibility, feature surface may
@@ -37,6 +39,7 @@ export const UPSTREAM_VALIDATED_VERSIONS = [
   '0.1.1-rc.1',
   '0.1.1-rc.2',
   '0.1.2-alpha.2',
+  '0.1.2-rc.1',
 ] as const
 
 /**

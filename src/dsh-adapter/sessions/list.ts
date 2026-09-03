@@ -84,12 +84,17 @@ async function enumerate(source: SessionSource, signal?: AbortSignal): Promise<L
     return snapshots.map(readSnapshot).filter((entry): entry is Listed => entry !== undefined)
   }
   if (typeof source.list === 'function') {
-    const headers = await source.list(signal)
-    return headers
-      .map((raw): Listed | undefined => {
+    const entries = await source.list(signal)
+    // dsh 0.1.2-rc.1: persistence.list() returns SessionPersistenceSnapshot
+    // records ({ header, revision }) rather than bare headers. Both shapes
+    // pass through readSnapshot first; a bare header (older hosts) has no
+    // `header` key, so it falls through to the legacy readHeader parse and
+    // keeps its undefined revision (derived from the file below).
+    return entries
+      .map((raw): Listed | undefined => readSnapshot(raw) ?? (() => {
         const header = readHeader(raw)
         return header === undefined ? undefined : { header, raw, revision: undefined }
-      })
+      })())
       .filter((entry): entry is Listed => entry !== undefined)
   }
   return []

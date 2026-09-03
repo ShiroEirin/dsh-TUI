@@ -35,19 +35,24 @@ export function rosterOf(ctx: Context): AgentPresetsLike | undefined {
   return ctx.get('agentPresets') as AgentPresetsLike | undefined
 }
 
-/** Resolve the durable preset projection: newest selection wins over header. */
-export function resolveRecordedPreset(session: {
-  header: { agentPreset?: string }
-  events: readonly { type: string; data: unknown }[]
-}): string | undefined {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]
+/**
+ * Resolve the durable preset projection: newest selection wins over header.
+ * The events read is hoisted to the caller (dsh 0.1.2-rc.1: live sessions
+ * expose snapshotEvents(), persisted logs are read through the persistence
+ * read handle), so this stays a pure fold.
+ */
+export function resolveRecordedPreset(
+  header: { agentPreset?: string },
+  events: readonly { type: string; data: unknown }[],
+): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
     if (event?.type !== 'agent-preset/selected') continue
     if (event.data === null || typeof event.data !== 'object') continue
     const selected = (event.data as { agentPreset?: unknown }).agentPreset
     if (typeof selected === 'string') return selected
   }
-  return session.header.agentPreset
+  return header.agentPreset
 }
 
 /**
