@@ -48,6 +48,9 @@ const ctxOf = (events) => ({
   get(key) {
     return key === 'sessionPersistence' && events !== undefined
       ? {
+          // Single-shot read: the seam always calls read(0) once, so the
+          // fromSeq parameter is intentionally ignored here (known limit —
+          // a future segmented read would need this stub extended).
           open: async () => ({
             header: {},
             read: async () => (typeof events === 'function' ? events() : events),
@@ -82,10 +85,23 @@ const sid = '00000000-1111-2222-3333-444444444444'
   check('bare log (no header) yields undefined', route === undefined, JSON.stringify(route))
 }
 
-// 4. Unreadable artifact → undefined, not a throw.
+// 4a. Unreadable artifact: the handle cannot even be OPENED → undefined.
+{
+  const ctx = {
+    get(key) {
+      return key === 'sessionPersistence'
+        ? { open: async () => { throw new Error('corrupt') } }
+        : undefined
+    },
+  }
+  const route = await resolvePersistedRoute(ctx, sid)
+  check('unreadable artifact (open throws) yields undefined', route === undefined, String(route))
+}
+
+// 4b. Unreadable artifact: the handle opens but READ fails → undefined.
 {
   const route = await resolvePersistedRoute(ctxOf(async () => { throw new Error('corrupt') }), sid)
-  check('unreadable artifact yields undefined', route === undefined, String(route))
+  check('unreadable artifact (read throws) yields undefined', route === undefined, String(route))
 }
 
 // 5. No persistence service → undefined.

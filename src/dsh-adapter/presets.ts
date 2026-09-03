@@ -21,6 +21,7 @@ import type { AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { recordedModelRoute, type ModelRoute } from '../modelRoute.js'
+import { sessionEventsOf } from './sessionEvents.js'
 import {
   resolveCompatiblePreset,
   resolveRecordedPreset,
@@ -129,11 +130,7 @@ export function runningPresetOf(session: {
   snapshotEvents?(): readonly { type: string; data: unknown }[]
   readonly events?: readonly { type: string; data: unknown }[]
 }): string | undefined {
-  const events =
-    typeof session.snapshotEvents === 'function'
-      ? session.snapshotEvents()
-      : session.events ?? []
-  return resolveRecordedPreset(session.header, events)
+  return resolveRecordedPreset(session.header, sessionEventsOf(session))
 }
 
 /**

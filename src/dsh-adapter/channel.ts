@@ -4362,8 +4362,11 @@ export function createChannel(
       // Same enumerate as the /resume listing (snapshots when the backend
       // offers revisions, plain list otherwise), each header narrowed through
       // the sessions reader — one malformed header costs that session its
-      // metadata, never the whole tree. `raw` stays the backend's own header
-      // object for locate() below.
+      // metadata, never the whole tree. `raw` stays whatever the backend's
+      // own enumeration handed back: the header object under listSnapshots,
+      // the WHOLE record under list() — locate() below receives its caller's
+      // original shape either way (rc.1 demoted it private; third-party
+      // backends that pair list-with-records + locate expect their record).
       let listed: { header: RawSessionHeader; raw: unknown }[] = []
       try {
         if (typeof persistence.listSnapshots === 'function') {
@@ -4677,12 +4680,16 @@ export function createChannel(
         const hasResolveLog = typeof resolveLog === 'function'
         const hasLocate = typeof locate === 'function'
         let locatedPath: string | undefined
+        let resolveLogFailed = false
         if (hasResolveLog) {
           try {
             const resolved: unknown = await resolveLog.call(persistence, id)
             if (typeof resolved === 'string' && resolved.length > 0) locatedPath = resolved
           } catch {
-            // Best effort — falls through to locate / stock scan.
+            // A THROWN resolveLog is a resolution hiccup, not the backend's
+            // authoritative "no artifact" (that answer is undefined/empty) —
+            // remember it so the stock scan below still gets its chance.
+            resolveLogFailed = true
           }
         }
         if (locatedPath === undefined && hasLocate && entry !== undefined) {
@@ -4711,7 +4718,7 @@ export function createChannel(
               readFrom = skipBelow
             }
           }
-        } else if (!hasResolveLog && !hasLocate) {
+        } else if ((!hasResolveLog || resolveLogFailed) && !hasLocate) {
           const read = readSessionEventsFromLog(id, remaining, scanAllowance, skipBelow)
           if (read !== undefined) {
             scanBudget -= read.scanned
