@@ -12,6 +12,7 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { runSideQuestion, wrapSideQuestion } from './sideQuestion.js'
+import { sessionEventsOf } from './sessionEvents.js'
 import { isReservedCredentialRef } from './credentialRefGuard.js'
 import { collectRecentActivity, parseRecapResponse, RECAP_RECENT_CHARS, wrapRecapPrompt, type RecapOutcome } from './recap.js'
 import { swallowNestedUpdateOverflow } from '../ink/update-overflow-guard.js'
@@ -2001,13 +2002,12 @@ const SessionLogOffset: (value: number) => SessionLogOffsetBrand = (() => {
 })()
 
 /**
- * dsh 0.1.2-rc.1 event-log read: prefer the rc.1+ snapshotEvents() method
- * and fall back to the legacy `events` getter on older host lines. Never
- * throws — an unknown shape yields no events (the caller's fold no-ops).
+ * dsh 0.1.2-rc.1 event-log read: the shared sessionEventsOf seam (see
+ * sessionEvents.ts), narrowed to the strict SessionEvent[] element type the
+ * channel folds consume. Never throws — an unknown shape yields no events.
  */
 function snapshotEventsOf(source: SessionEventSource): readonly SessionEvent[] {
-  if (typeof source.snapshotEvents === 'function') return source.snapshotEvents()
-  return source.events ?? []
+  return sessionEventsOf(source) as readonly SessionEvent[]
 }
 
 /** Resolve once a `turn/end` event newer than `fromSeq` lands in the session
@@ -4374,10 +4374,18 @@ export function createChannel(
             return header === undefined ? [] : [{ header, raw }]
           })
         } else if (typeof persistence.list === 'function') {
-          const headers = await persistence.list()
-          listed = headers.flatMap(raw => {
+          // dsh 0.1.2-rc.1: persistence.list() returns SessionPersistenceSnapshot
+          // records ({ header, revision }) rather than bare headers. Both shapes
+          // pass through the sessions reader's snapshot parse first; a bare
+          // header (older hosts) has no 'header' key and falls through to the
+          // legacy readHeader parse — the same dual-shape discipline
+          // sessions/list.ts enumerate() applies.
+          const entries = await persistence.list()
+          listed = entries.flatMap(entry => {
+            const snapshot = entry as { header?: unknown } | null
+            const raw = snapshot?.header ?? entry
             const header = readHeader(raw)
-            return header === undefined ? [] : [{ header, raw }]
+            return header === undefined ? [] : [{ header, raw: entry }]
           })
         }
       } catch {
@@ -4550,7 +4558,14 @@ export function createChannel(
           // Skipping it exactly like the non-live reads do keeps a live fork
           // of a huge parent from spending the whole family budget on
           // duplicated history and evicting its own siblings.
-          const liveSeed = liveHeader?.header.seedLength ?? liveMeta?.seedLength
+          // dsh 0.1.2-rc.1: the logical SessionHeader no longer carries
+          // seedLength (only the isSeeded boolean); the exact inherited cut
+          // lives on the live Session as the public inheritedEventCount field.
+          // Dual-shape read: rc.1 field first, legacy header second.
+          const liveInherited = (liveSession as { inheritedEventCount?: number }).inheritedEventCount
+          const liveSeed = liveInherited
+            ?? liveHeader?.header.seedLength
+            ?? liveMeta?.seedLength
           const skipBelow =
             liveParent !== undefined && liveSeed !== undefined
               ? Math.min(liveSeed, parentCovered + 1)
@@ -4575,8 +4590,8 @@ export function createChannel(
             id,
             createdAt: liveHeader?.header.createdAt ?? liveMeta?.createdAt ?? Date.now(),
             ...(liveParent !== undefined ? { parentSession: liveParent } : {}),
-            ...(liveHeader?.header.seedLength !== undefined || liveMeta?.seedLength !== undefined
-              ? { seedLength: liveHeader?.header.seedLength ?? liveMeta!.seedLength }
+            ...(liveInherited !== undefined || liveHeader?.header.seedLength !== undefined || liveMeta?.seedLength !== undefined
+              ? { seedLength: liveInherited ?? liveHeader?.header.seedLength ?? liveMeta!.seedLength }
               : {}),
             events,
             live: true,
@@ -4653,10 +4668,24 @@ export function createChannel(
         // Per-log scan allowance: the usual 4×-of-remaining derivation,
         // clamped to what the tree-level scan budget still has.
         const scanAllowance = Math.min(defaultMaxScanned(remaining), scanBudget)
+        // dsh 0.1.2-rc.1: locate() was demoted to private on the jsonl
+        // backend; its public successor resolveLog(id) returns the artifact
+        // path directly. Prefer the public API and keep the locate shape for
+        // older hosts and third-party backends that still expose it.
+        const resolveLog = (persistence as { resolveLog?: (id: string) => Promise<string | undefined> }).resolveLog
         const locate = persistence.locate
+        const hasResolveLog = typeof resolveLog === 'function'
         const hasLocate = typeof locate === 'function'
-        if (hasLocate && entry !== undefined) {
-          let locatedPath: string | undefined
+        let locatedPath: string | undefined
+        if (hasResolveLog) {
+          try {
+            const resolved: unknown = await resolveLog.call(persistence, id)
+            if (typeof resolved === 'string' && resolved.length > 0) locatedPath = resolved
+          } catch {
+            // Best effort — falls through to locate / stock scan.
+          }
+        }
+        if (locatedPath === undefined && hasLocate && entry !== undefined) {
           try {
             const location: unknown = locate.call(persistence, entry.raw)
             // Only the jsonl kind enters the compat file layer — a foreign
@@ -4670,19 +4699,19 @@ export function createChannel(
           } catch {
             // Best effort — a locate hiccup falls through to inspect.
           }
-          if (locatedPath !== undefined) {
-            const viaPath = readSessionEventsFromFile(locatedPath, remaining, scanAllowance, skipBelow)
-            if (viaPath !== undefined) {
-              scanBudget -= viaPath.scanned
-              if (viaPath.failed === true) failed = true
-              else {
-                events = viaPath.events
-                complete = viaPath.complete
-                readFrom = skipBelow
-              }
+        }
+        if (locatedPath !== undefined) {
+          const viaPath = readSessionEventsFromFile(locatedPath, remaining, scanAllowance, skipBelow)
+          if (viaPath !== undefined) {
+            scanBudget -= viaPath.scanned
+            if (viaPath.failed === true) failed = true
+            else {
+              events = viaPath.events
+              complete = viaPath.complete
+              readFrom = skipBelow
             }
           }
-        } else if (!hasLocate) {
+        } else if (!hasResolveLog && !hasLocate) {
           const read = readSessionEventsFromLog(id, remaining, scanAllowance, skipBelow)
           if (read !== undefined) {
             scanBudget -= read.scanned

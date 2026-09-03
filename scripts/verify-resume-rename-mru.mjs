@@ -19,15 +19,18 @@
  *   4. the rename touched MRU, pulling the row to the top;
  *   5. last-used.json actually recorded the touch.
  *
- * The persistence stub deliberately offers only `list` — no `listSnapshots`
- * and no `locate` — so this also covers the degraded path: change tokens
- * derived from the file itself, and log paths resolved by the compat scan.
+ * The persistence stub mirrors the dsh 0.1.2-rc.1 public surface: `list()`
+ * returns `{ header, revision }` snapshot records, and there is no
+ * `listSnapshots`, no `load`, no `inspect`, no `locate` — so this also
+ * covers the degraded path: log paths resolved by the compat scan. The rc.1
+ * record shape is the whole point: a regression in the snapshot unpack
+ * (bare-header parse hitting a record) drops every row here, loudly.
  *
  * Run with plain node against the compiled lib: `node scripts/verify-resume-rename-mru.mjs`
  * Exits non-zero on any assertion failure (CI gate).
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
@@ -68,7 +71,21 @@ const ctx = {
   on() { return () => {} },
   get(name) {
     if (name === 'sessionPersistence') {
-      return { list: async () => headers, load: async () => ({ events: [] }) }
+      // dsh 0.1.2-rc.1 shape: snapshot records, nothing else on the surface.
+      // The revision mirrors the real backend's honesty: it changes when the
+      // log is appended to (rename), so a stale cached title is never reused.
+      return {
+        list: async () => headers.map(header => {
+          let revision = `r${header.createdAt}`
+          try {
+            const facts = statSync(join(root, '--work-space--', header.id, 'session.jsonl.zstd'))
+            revision = `r${facts.size}:${facts.mtimeMs}`
+          } catch {
+            // No artifact yet: the creation stamp stands in.
+          }
+          return { header, revision }
+        }),
+      }
     }
     return undefined
   },

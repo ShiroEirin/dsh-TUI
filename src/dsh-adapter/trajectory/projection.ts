@@ -34,7 +34,7 @@
  * Storage-level chunk packing (`text-chunks`, `reasoning-chunks`,
  * `tool-call-chunks`) is a durable *encoding*, not an event vocabulary: the
  * persistence reader expands those rows back into `assistant/chunk` events
- * before they reach `Session.events`, so this fold only ever sees the
+ * before they reach `Session.snapshotEvents()`, so this fold only ever sees the
  * expanded form.
  */
 
