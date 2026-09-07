@@ -380,7 +380,7 @@ const GROUPS = {
 // classic 仍捆绑眨眼+喷水+摆尾）、随机选取 API 覆盖/钳制/每次挂载
 // 独立重掷、LogoV2 渲染冒烟（粉爱心/灰 Z 上屏后落定消失）。
     ["verify-whale-intro", ['node', '--import', 'tsx/esm', 'scripts/verify-whale-intro.mjs']],
-// 开屏定格后的鲸鱼闲置行为（whaleIdle 设置，默认关）：纯规划器帧选
+// 开屏定格后的鲸鱼闲置行为（whaleIdle 设置，默认开）：纯规划器帧选
 // 择与节拍（闲置偶动/入睡/工作唤醒/点击爱心单向播完）、频道接线。
     ["verify-whale-idle", ['node', '--import', 'tsx/esm', 'scripts/verify-whale-idle.mjs']],
 // 计划退出恢复进入前权限；覆盖延迟切换、会话恢复与未知权限不提权。
@@ -535,6 +535,12 @@ const GROUPS = {
 // 提问面板 hideCustomInput 行为回归：纯选择题隐藏输入行且 Tab/打字
 // 不劫持焦点，纯文本题忽略 hide 标记，多选题默认行为不回退。
     ["verify-askpanel-hide-custom-input", ['node', '--import', 'tsx/esm', 'scripts/verify-askpanel-hide-custom-input.tsx']],
+// 问卷面板粘贴回归：bracketed paste 压平插入（纯换行块不得提交、ANSI/
+// OSC 剥净）、Ctrl+V/Alt+V 异步剪贴板插入到实时光标（读期间打字真竞态
+// 臂、busy 去重）、选项行粘贴追加+附加标签、plan-review 粘贴绝不快选/
+// 批准、隐藏输入题粘贴惰性、超长粘贴上限报错、同 chunk 批量按键经同步
+// ref 依序编辑、emoji 码点步进。
+    ["verify-question-paste", ['node', '--import', 'tsx/esm', 'scripts/verify-question-paste.tsx']],
 // 长问卷列表回归：24 行终端中的 36 个两行 provider 选项必须围绕
 // focusIndex 窗口化，初始和深度导航后焦点 label/单选标记始终可见。
     ["verify-askpanel-long-list", ['node', '--import', 'tsx/esm', 'scripts/verify-askpanel-long-list.tsx']],
