@@ -5465,14 +5465,20 @@ export function createChannel(
         // parse chunk-heavy logs whole. Header facts come from list().
         const remaining = MAX_TREE_EVENTS - eventBudget
         // Source precedence, all read-only:
-        //  1. persistence.locate — the backend's OWN artifact resolution is
+        //  1. The backend's OWN artifact resolution — rc.1's public
+        //     resolveLog(id) first (locate() was demoted private there),
+        //     then locate on older hosts / third-party backends — is
         //     authoritative (custom root, workspace-key scheme). When it
         //     names a path, ONLY that file is read: falling back to a
         //     same-id copy under the stock root could surface a STALE log
-        //     from another backend configuration. A locate miss or an ABSENT
-        //     file falls through to inspect, never to the stock scan.
-        //  2. Stock root scan — only for backends WITHOUT locate (fakes,
-        //     older custom implementations).
+        //     from another backend configuration. A resolver MISS
+        //     (undefined/empty) or an ABSENT file falls through to inspect,
+        //     never to the stock scan; only a THROWN resolveLog is a
+        //     resolution hiccup, not an authoritative miss, and may fall
+        //     back to the stock scan.
+        //  2. Stock root scan — only for backends WITHOUT a resolver
+        //     (fakes, older custom implementations), or when resolveLog
+        //     threw.
         //  3. inspect — the backend's strict read (non-file backends), with
         //     the same budget enforced on what we keep — and ONLY when the
         //     file read found NOTHING (undefined). A read that failed on a
