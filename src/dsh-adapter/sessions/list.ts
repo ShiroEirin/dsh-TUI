@@ -89,10 +89,15 @@ async function enumerate(source: SessionSource, signal?: AbortSignal): Promise<L
     return snapshots.map(readSnapshot).filter((entry): entry is Listed => entry !== undefined)
   }
   if (typeof source.list === 'function') {
-    // dsh 0.1.2-rc.1: list() takes an options object ({ signal }). Legacy
-    // positional-signal hosts ignore the object (their signal simply goes
-    // unused), so the object shape is safe on both lines.
-    const entries = await source.list(signal !== undefined ? { signal } : undefined)
+    // dsh 0.1.2-rc.1: list() takes an options object ({ signal }) and
+    // resolves artifact paths through the public resolveLog(id). Legacy
+    // hosts took a positional signal — hand those backends the AbortSignal
+    // itself, never { signal }: a legacy list() would read .aborted off the
+    // object and mishandle cancellation. Dispatch on the rc.1 capability.
+    const rc1OptionsForm = typeof (source as { resolveLog?: unknown }).resolveLog === 'function'
+    const entries = rc1OptionsForm
+      ? await source.list(signal !== undefined ? { signal } : undefined)
+      : await source.list(signal)
     // dsh 0.1.2-rc.1: persistence.list() returns SessionPersistenceSnapshot
     // records ({ header, revision }) rather than bare headers. Both shapes
     // pass through readSnapshot first; a bare header (older hosts) has no

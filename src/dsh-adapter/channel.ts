@@ -5138,7 +5138,7 @@ export function createChannel(
             const snapshot = entry as { header?: unknown } | null
             const raw = snapshot?.header ?? entry
             const header = readHeader(raw)
-            return header === undefined ? [] : [{ header, raw: entry }]
+            return header === undefined ? [] : [{ header, raw }]
           })
         }
       } catch {
@@ -5490,20 +5490,25 @@ export function createChannel(
         // Per-log scan allowance: the usual 4×-of-remaining derivation,
         // clamped to what the tree-level scan budget still has.
         const scanAllowance = Math.min(defaultMaxScanned(remaining), scanBudget)
-        if (hasLocate) {
-          if (locatedPath !== undefined) {
-            const viaPath = readSessionEventsFromFile(locatedPath, remaining, scanAllowance, skipBelow)
-            if (viaPath !== undefined) {
-              scanBudget -= viaPath.scanned
-              if (viaPath.failed === true) failed = true
-              else {
-                events = viaPath.events
-                complete = viaPath.complete
-                readFrom = skipBelow
-              }
+        if (locatedPath !== undefined) {
+          // A resolver (rc.1 resolveLog, or locate on older hosts) named an
+          // artifact path — read ONLY that file. Stock roots could hold a
+          // stale same-id copy from another backend configuration.
+          const viaPath = readSessionEventsFromFile(locatedPath, remaining, scanAllowance, skipBelow)
+          if (viaPath !== undefined) {
+            scanBudget -= viaPath.scanned
+            if (viaPath.failed === true) failed = true
+            else {
+              events = viaPath.events
+              complete = viaPath.complete
+              readFrom = skipBelow
             }
           }
-        } else if (!hasLocate) {
+        } else if ((!hasResolveLog || resolveLogFailed) && !hasLocate) {
+          // Stock root scan — only when NO resolver exists (fakes, older
+          // backends) or resolveLog THREW (a hiccup, not an authoritative
+          // miss: undefined or empty is the authoritative "no artifact" and
+          // must NOT fall back to a stock copy).
           const read = readSessionEventsFromLog(id, remaining, scanAllowance, skipBelow)
           if (read !== undefined) {
             scanBudget -= read.scanned
