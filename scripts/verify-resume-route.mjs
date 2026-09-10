@@ -53,7 +53,7 @@ const ctxOf = (events) => ({
           // a future segmented read would need this stub extended).
           open: async () => ({
             header: {},
-            read: async () => (typeof events === 'function' ? events() : events),
+            read: async () => ({ events: typeof events === 'function' ? events() : events }),
             close: async () => {},
           }),
         }

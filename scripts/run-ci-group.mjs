@@ -132,6 +132,10 @@ const GROUPS = {
 // 预算、行恒 1 不换行——断言零 wrapped 行、Pane 内无幽灵空行、翻页
 // 后标题/页脚/焦点仍在屏。
     ["verify-picker-edge", ['node', '--import', 'tsx/esm', 'scripts/verify-picker-edge.tsx']],
+// 浮层锚点空间预算回归（#493/#698）：OverlayAbove 把 maxHeight 钳到输入簇
+// 上方真实可画行数并把预算交给 picker 窗口化——短会话 + 高终端下标题/
+// 焦点/页脚全部在屏、页脚紧贴输入行；长会话不过度钳制。
+    ["verify-overlay-anchor-budget", ['node', '--import', 'tsx/esm', 'scripts/verify-overlay-anchor-budget.tsx']],
 // 滚动条 gutter 三态回归：rail 悬停/滚动/常驻三模式下 gutter 占位
 // 与内容宽度协商，切换不闪烁、不塌行。
     ["verify-scrollbar-gutter", ['node', '--import', 'tsx/esm', 'scripts/verify-scrollbar-gutter.tsx']],
@@ -146,9 +150,16 @@ const GROUPS = {
 // 时间线 rail 回归：rail 覆盖全部轮次（含折叠轮），高亮锚定视口顶、
 // ▲/▼ 目标不越过 maxScroll。
     ["verify-timeline-rail", ['node', '--import', 'tsx/esm', 'scripts/verify-timeline-rail.tsx']],
+// 多行 user 的置顶摘要不得向转录左侧出血；宽/窄终端均保留滚动锚定。
+    ['verify-sticky-anchor', ['node', '--import', 'tsx/esm', 'scripts/verify-sticky-anchor.tsx']],
+    ['verify-sticky-anchor-narrow', ['node', '--import', 'tsx/esm', 'scripts/verify-sticky-anchor.tsx'], { DSH_TEST_COLUMNS: '60' }],
 // 恢复历史会话落点回归：/resume 后最新消息末行必须可见且可达
 // （scrollToBottom 补画完成后的锚定终态），不再落屏外。
     ["repro-resume-position", ['node', '--import', 'tsx/esm', 'scripts/repro-resume-position.tsx']],
+// 全屏转录键盘翻页回归：PgUp/PgDn 一次一页、到底按 at-bottom 契约重粘；
+// help 浮层让位、问询面板不让位（面板在转录下方且不消费这对键）、inline
+// 模式不接管（历史在终端原生 scrollback）、窄终端行为一致。
+    ["verify-transcript-paging", ['node', 'scripts/verify-transcript-paging.mjs']],
   ],
   'input-terminal': [
 // 按键解析回归（issue #110）：Option+Enter（ESC CR）精确/合并/分块
@@ -435,6 +446,8 @@ const GROUPS = {
 // 丢上下文"事故根因）；persistence 类失败与通用失败分开提示。
     ["verify-compact-switch", ['node', '--import', 'tsx/esm', 'scripts/verify-compact-switch.tsx']],
     ["verify-live-session", ['node', '--import', 'tsx/esm', 'scripts/verify-live-session.ts']],
+    ["verify-session-v3", ['node', '--import', 'tsx/esm', 'scripts/verify-session-v3.ts']],
+    ["verify-session-tree-generations", ['node', '--import', 'tsx/esm', 'scripts/verify-session-tree-generations.ts']],
 // 裸 ● 空行回归：纯思考/纯工具步骤（无文本块）的 assistant/message
 // 不得创建空 assistant 行，否则思考块折叠后转录里多出一个只有
 // ● 前缀、内容为空的行。
@@ -650,6 +663,12 @@ for (let i = 0; i < flags.length; i++) {
 }
 const group = wholeGroup.filter((_, i) => i % shard.count === shard.index - 1)
 const label = shard.count === 1 ? groupName : groupName + ' ' + shard.index + '/' + shard.count
+// 分片数超过组内条目数时后面的片是空的：exit 0 会报"全部 0 项通过"，ci.yml 里
+// 一个写错的 matrix 就能让整片静默变绿。空片判配置错误，与非法参数同级。
+if (group.length === 0) {
+  console.error('[run-ci-group] ' + label + ' 没有任何条目（组内共 ' + wholeGroup.length + ' 项）——分片数超过条目数')
+  process.exit(2)
+}
 
 if (listOnly) {
   console.log(label + '（' + group.length + '/' + wholeGroup.length + ' 项）')

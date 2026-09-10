@@ -112,7 +112,7 @@ const persistedPreset = await resolvePersistedPreset({
         assert.equal(mode, 'read')
         return {
           header: legacyHeaderSession.header,
-          read: async () => legacyHeaderSession.events,
+          read: async () => ({ events: legacyHeaderSession.events }),
           close: async () => {},
         }
       },

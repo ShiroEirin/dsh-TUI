@@ -22,6 +22,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { recordedModelRoute, type ModelRoute } from '../modelRoute.js'
 import { snapshotLiveSessionEvents } from './compat/liveSession.js'
+import { readPersistedSession, type SessionReader } from './compat/persistence.js'
 import {
   resolveCompatiblePreset,
   resolveRecordedPreset,
@@ -83,35 +84,15 @@ export async function composePreset(ctx: Context, requested?: string): Promise<P
  * @returns The running preset id, or undefined when unrecorded/unreadable.
  */
 export async function resolvePersistedPreset(ctx: Context, sessionId: SessionId): Promise<string | undefined> {
-  const persistence = ctx.get('sessionPersistence') as
-    | {
-        // dsh 0.1.2-rc.1 removed SessionPersistence.load()/inspect(); the
-        // read-handle seam (open → h.read(0) → h.header → h.close()) replaces
-        // them. Structural on purpose: the service is resolved from a running
-        // context whose packages may be a version apart from ours.
-        open(id: SessionId, mode: 'read'): Promise<{
-          header: { agentPreset?: string }
-          read(fromSeq: number): Promise<readonly { type: string; data: unknown }[]>
-          close(): Promise<void>
-        }>
-      }
-    | undefined
+  const persistence = ctx.get('sessionPersistence') as SessionReader | undefined
   if (persistence === undefined) return undefined
-  let handle: Awaited<ReturnType<typeof persistence.open>>
   try {
-    handle = await persistence.open(sessionId, 'read')
+    const { meta, events } = await readPersistedSession(persistence, sessionId)
+    return resolveRecordedPreset({ header: meta, events })
   } catch {
     // A missing/corrupt artifact leaves resume itself to report the failure;
     // the preset lookup must not mask it with a second, misleading error.
     return undefined
-  }
-  try {
-    return resolveRecordedPreset({ header: handle.header, events: await handle.read(0) })
-  } catch {
-    // Same degraded-read contract as the open failure above.
-    return undefined
-  } finally {
-    await handle.close().catch(() => {})
   }
 }
 
@@ -145,32 +126,15 @@ export function runningPresetOf(session: unknown): string | undefined {
  * @returns The recorded model route, or undefined when unrecorded/unreadable.
  */
 export async function resolvePersistedRoute(ctx: Context, sessionId: SessionId): Promise<ModelRoute | undefined> {
-  const persistence = ctx.get('sessionPersistence') as
-    | {
-        // Same rc.1 read-handle seam as resolvePersistedPreset (see above).
-        open(id: SessionId, mode: 'read'): Promise<{
-          header: unknown
-          read(fromSeq: number): Promise<readonly { type: string; data?: unknown }[]>
-          close(): Promise<void>
-        }>
-      }
-    | undefined
+  const persistence = ctx.get('sessionPersistence') as SessionReader | undefined
   if (persistence === undefined) return undefined
-  let handle: Awaited<ReturnType<typeof persistence.open>>
   try {
-    handle = await persistence.open(sessionId, 'read')
+    const { events } = await readPersistedSession(persistence, sessionId)
+    return recordedModelRoute(events)
   } catch {
     // A missing/corrupt artifact leaves resume itself to report the failure;
     // the route lookup must not mask it with a second, misleading error.
     return undefined
-  }
-  try {
-    return recordedModelRoute(await handle.read(0))
-  } catch {
-    // Same degraded-read contract as the open failure above.
-    return undefined
-  } finally {
-    await handle.close().catch(() => {})
   }
 }
 
