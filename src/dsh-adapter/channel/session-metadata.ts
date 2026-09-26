@@ -3,7 +3,7 @@ import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import { clearResumeTarget, forgetSession, readResumeTarget, touchSession, writeResumeTarget } from '../../sessionHistory.js'
 import { t } from '../../i18n.js'
-import { appendSessionTitle, deleteSessionLog } from '../compat/index.js'
+import { appendSessionTitle, deleteSessionLog, userTitleData } from '../compat/index.js'
 import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
 import { collectRecentActivity, parseRecapResponse, RECAP_RECENT_CHARS, wrapRecapPrompt } from '../recap.js'
 import { listSummaries, locateSession, previewSession, type SessionSource, type SessionSummary } from '../sessions/index.js'
@@ -11,6 +11,15 @@ import { runSideQuestion, wrapSideQuestion } from '../sideQuestion.js'
 import type { ChannelOwner } from './owner.js'
 import type { CredentialStatus, SideQuestionLlm } from './types.js'
 import { isUserInvocable } from '@deepseek-ai/dsh-skill'
+
+// These tool-less requests never enter the session log. Give each producer
+// its own source kind, as required by 0.1.7 (the old catch-all was removed).
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-tui-btw': { kind: 'dsh-tui-btw' }
+    'dsh-tui-recap': { kind: 'dsh-tui-recap' }
+  }
+}
 
 const PREVIEW_ENTRIES = 8
 
@@ -146,7 +155,7 @@ export function createSessionMetadataActions(ctx: Context, deps: {
       stream: llm.stream.bind(llm),
       options: llmRequest(capture, [
         ...capture.agent.session.deriveMessages(),
-        createUserMessage({ content: [{ type: 'text', text: wrapSideQuestion(question) }], source: { kind: 'plugin', plugin: 'dsh-tui/btw' } }),
+        createUserMessage({ content: [{ type: 'text', text: wrapSideQuestion(question) }], source: { kind: 'dsh-tui-btw' } }),
       ], true, signal),
       // Do not let an old session append streamed UI facts after a switch.
       onText: delta => { if (current(capture) && !options?.signal?.aborted) options?.onText?.(delta) },
@@ -168,7 +177,7 @@ export function createSessionMetadataActions(ctx: Context, deps: {
     const outcome = await runSideQuestion({
       stream: llm.stream.bind(llm),
       options: llmRequest(capture, [
-        createUserMessage({ content: [{ type: 'text', text: wrapRecapPrompt(activity) }], source: { kind: 'plugin', plugin: 'dsh-tui/recap' } }),
+        createUserMessage({ content: [{ type: 'text', text: wrapRecapPrompt(activity) }], source: { kind: 'dsh-tui-recap' } }),
       ], false, signal),
       onText: delta => { if (current(capture) && !options?.signal?.aborted) options?.onText?.(delta) },
       signal,
@@ -181,7 +190,9 @@ export function createSessionMetadataActions(ctx: Context, deps: {
   const renameSession = (title: string): void => {
     const capture = deps.binding.capture()
     if (!current(capture)) return
-    capture.agent.session.append('session/title', { title })
+    // Live rename: the same strict-reader-required payload the offline append
+    // writes — a `{ title }`-only event made the log unopenable (issue #1006).
+    capture.agent.session.append('session/title', userTitleData(title))
     deps.setSessionTitle(title)
     deps.emit()
   }

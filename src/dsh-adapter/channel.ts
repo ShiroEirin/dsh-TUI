@@ -34,12 +34,15 @@ import { createSkillCatalog } from './channel/skill-catalog.js'
 import { createBackgroundCurrentAction } from './channel/background-action.js'
 import { createSubagentProjection } from './channel/subagent-projection.js'
 import { createChannelNotifications } from './channel/notifications.js'
+import { createSelectionAttachments } from './channel/ide-selection.js'
+import { IdeChannel, ideLockDir, type SelectionSnapshot } from './ide-channel.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { type Agent, type AgentHandle, type CreateAgentOptions, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
 import {
   createUserMessage,
   ReasoningEffortId,
+  type UserMessage,
 } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { randomUUID } from 'node:crypto'
@@ -65,6 +68,7 @@ import { createChannelEmitter } from './channel/emitter.js'
 import { createInputActions, type InputConvergence } from './channel/input-actions.js'
 import { createComposerImages } from './channel/composer-images.js'
 import { snapshotLiveSessionEvents } from './compat/liveSession.js'
+import { runForegroundShell, type ForegroundShell } from './compat/shell.js'
 import { createPermissionModeRoster } from './channel/mode-roster.js'
 import { createPermissionModeActions } from './channel/mode-permission-actions.js'
 import { expandMentions, mentionAttachments, mentionFs } from './channel/mentions.js'
@@ -201,7 +205,7 @@ function createChannelWithOwner(
     agent: () => binding.agent,
     subagents: () => (ctx as { get(name: string): unknown }).get('subagents') as { interrupt?(target: string, reason: unknown): void } | undefined,
     lookupChild: id => {
-      const agents = ctx.get('agents') as { get(id: string): { session?: unknown; options?: { provider?: string; model?: string } } | undefined } | undefined
+      const agents = ctx.get('agents') as { get(id: string): { status?: string; session?: unknown; options?: { provider?: string; model?: string } } | undefined } | undefined
       return agents?.get(id)
     },
   })
@@ -302,10 +306,51 @@ function createChannelWithOwner(
     CONTEXT_WARNING_BUFFER_TOKENS,
   )
   const { warning: contextWarning, resetContextWarning, checkContextWarning, trackPending, untrackPending } = bookkeeping
+  // IDE selection channel (AC-5): one IdeChannel per channel factory, started
+  // in the background against the session cwd — lock discovery needs it, env
+  // direct-connect does not but tolerates the extra hint. start() is fully
+  // non-throwing and self-degrading, so a missing IDE costs nothing and
+  // startup never waits on the loopback dial.
+  const ideChannel = new IdeChannel()
+  void ideChannel.start(process.env, ideLockDir(), options.cwd).catch(() => {})
+  let currentSelection: SelectionSnapshot | undefined
+  ideChannel.onSelection(snapshot => {
+    // The channel already clears empty snapshots internally; mirror that here
+    // so consumption reads one consistent variable.
+    currentSelection = snapshot.isEmpty ? undefined : snapshot
+    // Live prompt-footer badge: the projection must reach the screen BEFORE
+    // the user submits — emit() bumps `version` so the useSyncExternalStore
+    // tree re-renders with the new badge immediately.
+    state.selection = currentSelection
+    state.emit()
+  })
+  /**
+   * Re-target the IDE selection link when the session's working directory
+   * changes (/resume adopts the persisted header cwd, /workspace switches to
+   * another directory, a background session is adopted): a selection made in
+   * the OLD workspace would otherwise stay projected — the badge shows it and
+   * the next submit attaches the wrong file — and the OLD link would keep
+   * pushing the old window's selections into the new workspace.
+   *
+   * rebind() drops the link and rediscovers against the new cwd (env-direct
+   * reconnects to the same spawned server; lock scan only ever returns
+   * candidates whose workspaceFolders cover the new cwd). Callers set
+   * state.cwd BEFORE this runs, so it reads the fresh value (maintainer
+   * review round 3: this used to only clear the cached selection and keep
+   * the stale connection alive).
+   */
+  const resetIdeSelection = (): void => {
+    currentSelection = undefined
+    state.selection = undefined
+    state.emit()
+    void ideChannel.rebind(state.cwd).catch(() => {})
+  }
+  const selectionAttachments = createSelectionAttachments()
   const composer = createComposerImages(ctx, owner, { generation: () => state.agentBindingGeneration })
   const inputDelivery = createInputDelivery(ctx, owner, binding, () => state,
-    (...args) => notify(...args), trackPending, untrackPending, composer)
-  const { dispatchUserText, deliverUserText, withDecisionPending, clearStagedImages } = inputDelivery
+    (...args) => notify(...args), trackPending, untrackPending, composer,
+    () => currentSelection, (messageId, info) => selectionAttachments.remember(messageId, info))
+  const { dispatchUserText, deliverUserText, retireAttachment, withDecisionPending, clearStagedImages } = inputDelivery
   /**
    * The `tui/session-switch` decision event (pi's `session_before_switch`),
    * fired before `/new` or `/resume` replaces the live session (rewind has
@@ -503,8 +548,15 @@ function createChannelWithOwner(
     },
     releaseContributions() {
       // Owner cleanup is exhaustive, but it can report an external cleanup
-      // failure. The local emitter is outside that owner and must still stop.
-      try { owner.dispose() } finally { emitter.dispose() }
+      // failure. The emitter and the IDE loopback link are both OUTSIDE the
+      // owner and must still stop no matter which earlier step throws — a
+      // bare trailing ideChannel.stop() used to be skipped whenever
+      // owner.dispose() threw, leaking the socket (maintainer review round 3).
+      try {
+        owner.dispose()
+      } finally {
+        try { emitter.dispose() } finally { ideChannel.stop() }
+      }
     },
     traceEvents() {
       // Immutable per-append snapshot (dsh-session caches the frozen array);
@@ -556,7 +608,10 @@ function createChannelWithOwner(
     cwd: () => state.cwd,
     setCommands(commands) { state.commandList = commands; state.emit() },
     commandDescriptions: name => commandTrees?.descriptions(name),
-    deliverUserText,
+    // Attached-context pass-through (T03 consumes the third parameter in the
+    // fallback branch): the skill catalog never loses the FIFO/decision fence.
+    deliverUserText: (text: string, placement: 'followup', attach?: UserMessage) =>
+      deliverUserText(text, placement, [], attach),
   })
   const skillViewOptions = skillCatalog.viewOptions
   const skillRegistryFor = skillCatalog.registryFor
@@ -624,16 +679,14 @@ function createChannelWithOwner(
       })
     }
   }
-  const bash = ctx.get('shell') as {
-    resolve(request: { command: string; workdir?: string; timeoutMs: number }): { command: string; timeoutMs: number }
-    run(spec: { command: string; timeoutMs: number }): Promise<{ stdout: { text: string }; stderr: { text: string }; timedOut: boolean }>
-  } | undefined
+  const bash = ctx.get('shell') as ForegroundShell | undefined
 
   const projector = createChannelProjection(state, {
     agent: () => binding.agent, rowIds, resetContextWarning, pendingTaskDescriptions, jobs: jobStore, inputConvergence,
     checkContextWarning, notify: (...args) => notify(...args),
     tools: ctx.get('tools') as ToolsRegistryLike | undefined, renderer: rendererRuntime,
     attachments: () => ctx.get('attachments'),
+    selectionAttached: messageId => selectionAttachments.take(messageId),
   })
   localActions = createLocalActions({
     ctx,
@@ -650,8 +703,15 @@ function createChannelWithOwner(
     notify,
   })
 
-  // Replay the durable transcript first, then follow live events.
-  projector.replayEvents(snapshotLiveSessionEvents(binding.agent.session))
+  // Replay the durable transcript first, then follow live events. The same
+  // seed re-populates the subagent dashboard's durable discovery facts
+  // (`subagent/catalog`, workflow member edges) so a resumed session keeps
+  // its dispatched-children history (issue #966).
+  const replaySessionSeed = (events: readonly SessionEvent[]): void => {
+    projector.replayEvents(events)
+    subagentProjection.bootstrapFromLog(events)
+  }
+  replaySessionSeed(snapshotLiveSessionEvents(binding.agent.session))
   projector.settleStreaming()
   // Attached to an idle agent: any replayed turn/start belongs to a previous
   // session run, so the spinner must not come up on boot.
@@ -670,6 +730,7 @@ function createChannelWithOwner(
     initialEffort: options.effort,
     agent: () => binding.agent,
     notify,
+    checkContextWarning,
   })
 
   commandCompletions = createCommandCompletions({
@@ -689,7 +750,7 @@ function createChannelWithOwner(
     resetProjector: () => projector.reset(),
     resetSubagents: subagentProjection.reset,
     resetJobs: resetJobProjection,
-    replay: events => projector.replayEvents(events),
+    replay: replaySessionSeed,
     settleReplay: projector.settleStreaming,
     bindAgent: () => bindAgent(),
     refreshCommands: refreshCommandList,
@@ -738,6 +799,7 @@ function createChannelWithOwner(
     subagents: subagentProjection,
     agentView,
     messageObserver,
+    retireAttachment,
   })
   const bindAgent = bindingEvents.bind
 
@@ -747,7 +809,7 @@ function createChannelWithOwner(
     resetProjector: () => projector.reset(),
     resetSubagents: subagentProjection.reset,
     resetJobs: resetJobProjection,
-    replay: events => projector.replayEvents(events),
+    replay: replaySessionSeed,
     settleReplay: projector.settleStreaming,
     bindAgent,
     refreshCommands: refreshCommandList,
@@ -765,7 +827,7 @@ function createChannelWithOwner(
     resetProjector: () => projector.reset(),
     resetSubagents: subagentProjection.reset,
     resetJobs: resetJobProjection,
-    replay: events => projector.replayEvents(events),
+    replay: replaySessionSeed,
     settleReplay: projector.settleStreaming,
     describeWorkspace: cwd => workspaceService.describe(cwd),
     refreshGitBranch: () => refreshGitBranch(),
@@ -774,6 +836,7 @@ function createChannelWithOwner(
     refreshLoadedContext,
     refreshSkillCommands,
     clearStagedImages,
+    resetIdeSelection,
     notifySessionSwitched,
     notifyAgentView: agentView.notify,
   })
@@ -787,12 +850,16 @@ function createChannelWithOwner(
   }, {
     owner,
     binding,
+    // `/resume` shares the live-adoption path with the session supervisor, so
+    // a target already running in this process is re-attached rather than
+    // resumed twice from its log (which would mount one log in two places).
+    adoptLive: target => adoptLiveAgent(target),
     backgroundHandles,
     rowIds,
     resetProjector: () => projector.reset(),
     resetSubagents: subagentProjection.reset,
     resetJobs: resetJobProjection,
-    replay: events => projector.replayEvents(events),
+    replay: replaySessionSeed,
     settleReplay: projector.settleStreaming,
     describeWorkspace: cwd => workspaceService.describe(cwd),
     refreshGitBranch: () => refreshGitBranch(),
@@ -801,6 +868,7 @@ function createChannelWithOwner(
     refreshLoadedContext,
     refreshSkillCommands,
     clearStagedImages,
+    resetIdeSelection,
     settleCompaction: () => settleManualCompaction(),
     sessionSwitchVetoed,
     notify,
@@ -886,6 +954,9 @@ function createChannelWithOwner(
     resumeTo: resumeToAction,
     newSession: newSessionAction,
     listWorkspaces: workspaceActions.listWorkspaces,
+    listWorkspaceRegistry: workspaceActions.listWorkspaceRegistry,
+    removeWorkspace: workspaceActions.removeWorkspace,
+    renameWorkspaceAt: workspaceActions.renameWorkspaceAt,
     resolveWorkspace: workspaceActions.resolveWorkspace,
     switchWorkspace: workspaceActions.switchWorkspace,
     renameWorkspace: workspaceActions.renameWorkspace,
@@ -997,14 +1068,11 @@ function createChannelWithOwner(
     // flight refreshes the branch for the NEW cwd, so a late reply from the
     // old workspace must be dropped (statusline staleness, issue #96 review).
     const requestedCwd = state.cwd
-    void bash
-      .run(
-        bash.resolve({
-          command: 'git branch --show-current',
-          workdir: requestedCwd,
-          timeoutMs: 3000,
-        }),
-      )
+    void runForegroundShell(bash, {
+      command: 'git branch --show-current',
+      workdir: requestedCwd,
+      timeoutMs: 3000,
+    })
       .then((result) => {
         if (!owner.current() || state.cwd !== requestedCwd) return
         const branch = result.stdout.text.trim()

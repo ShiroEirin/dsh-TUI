@@ -28,9 +28,14 @@ export function createBindingEvents(ctx: Context, deps: {
   modelActions: { applyPreferredEffort(): Promise<void>; selection: ModelSelectionRef }
   modeActions: { refreshMode(): void; onSessionEvent(session: unknown, event: unknown): void }
   projector: ReturnType<typeof createChannelProjection>
-  subagents: { onSessionEvent(session: unknown, event: unknown): boolean; onStreamFrame?(agent: unknown, frame: AssistantStreamFrame): boolean; onStart(info: { id: string; runId?: string; provider: string; local?: boolean }): void; onEnd(info: { id: string; stopReason: string; lastAssistantMessage?: unknown[] }): void }
+  subagents: { onSessionEvent(session: unknown, event: unknown): boolean; onStreamFrame?(agent: unknown, frame: AssistantStreamFrame): boolean; onParentEvent?(event: unknown): void; onStart(info: { id: string; runId?: string; provider: string; local?: boolean }): void; onEnd(info: { id: string; runId?: string; stopReason: string; lastAssistantMessage?: unknown[] }): void }
   agentView: { schedule(): void }
   messageObserver?: { publish(session: unknown, event: unknown): void }
+  /** Drop a pre-step attachment registered by this channel for one message id
+   *  (input-delivery's `retireAttachment`); see the discard hook below.
+   *  Optional for direct/embed constructors that never emit inbox discards;
+   *  channel.ts always wires it. */
+  retireAttachment?(messageId: string): void
 }) {
   const reconcileRetiredProjection = (status: 'idle' | 'disposed'): void => {
     if (!deps.state.working) return
@@ -113,22 +118,35 @@ export function createBindingEvents(ctx: Context, deps: {
         reconcileRetiredProjection('disposed')
         deps.state.emit()
       })
-      const retirePending = (payload: { agent: unknown; message: { id?: unknown } }): void => {
+      /**
+       * The inbox removed one message. Both events retire the pending
+       * preview, but ONLY a discard retires an attached-context entry:
+       * `agent/inbox/claimed` fires while the loop claims the batch, BEFORE
+       * the resident `agent/pre-step` listener can append the attachment —
+       * retiring there would delete the context before it is ever injected
+       * (dsh-agent-loop: `inbox.claim()` → claimed event → `agent/pre-step`).
+       */
+      const retirePending = (payload: { agent: unknown; message: { id?: unknown } }, alsoRetireAttachment = false): void => {
         if (!current() || payload.agent !== capture.agent) return
         const messageId = payload.message?.id
         if (typeof messageId !== 'string') return
+        if (alsoRetireAttachment) deps.retireAttachment?.(messageId)
         const before = deps.state.pending.length
         deps.state.pending = deps.state.pending.filter(item => item.id !== messageId)
         if (deps.state.pending.length !== before) deps.state.emit()
       }
       on('agent/inbox/claimed', retirePending)
-      on('agent/inbox/discarded', retirePending)
+      on('agent/inbox/discarded', payload => retirePending(payload, true))
       on('session/event', (subject, event) => {
         if (!current()) return
         const isMainSession = subject === session
         if (!isMainSession && deps.subagents.onSessionEvent(subject, event)) return
         if (!isMainSession) return
         deps.messageObserver?.publish(subject, event)
+        // Parent-log discovery events (`subagent/catalog`, workflow member
+        // edges) reach the dashboard through the same firehose; they are not
+        // transcript rows and render below remains untouched by them.
+        deps.subagents.onParentEvent?.(event)
         deps.activity.onSessionEvent(event)
         deps.modeActions.onSessionEvent(subject, event)
         deps.projector.renderEvent(event)

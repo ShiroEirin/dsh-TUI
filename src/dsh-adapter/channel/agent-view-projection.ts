@@ -19,6 +19,7 @@ import {
 } from '../agent-view.js'
 import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
 import { composePreset } from '../presets.js'
+import { reserveNewSession } from '../../sessionMounts.js'
 import { locateSession, previewSession, type SessionSource, type SessionSummary } from '../sessions/index.js'
 import { attachSessionToWorkspace } from '../workspace.js'
 import { logForDebugging } from '../../utils/debug.js'
@@ -39,7 +40,7 @@ export function createAgentViewProjection(
   ctx: Context,
   deps: {
     owner: Pick<ChannelOwner, 'current' | 'assertActive' | 'own'>
-    binding: Pick<Binding, 'agent' | 'capture' | 'isCurrent' | 'prepare' | 'abandon'>
+    binding: Pick<Binding, 'agent' | 'capture' | 'isCurrent' | 'prepare' | 'abandon' | 'waitForDisposal'>
     cwd(): string
     configuredPreset?: string
     configuredProvider?: string
@@ -116,7 +117,7 @@ export function createAgentViewProjection(
     // These process-wide roster observations still belong to this channel
     // owner. Revoke them so a retained Context cannot wake a dead projection.
     disposeStatus = ctx.on('agent/status', () => schedule())
-    disposeCreated = ctx.on('agent/created', () => notify())
+    disposeCreated = ctx.on('agent/created', () => { notify() })
     disposeDisposed = ctx.on('agent/disposed', ({ agent }: { agent: { id?: unknown } }) => {
       folds.delete(String(agent.id ?? ''))
       backgroundHandles.delete(String(agent.id ?? ''))
@@ -174,6 +175,10 @@ export function createAgentViewProjection(
       return { ok: false, reason: 'unavailable' }
     }
     const sessionId = SessionId(randomUUID())
+    // Announce the id before the factory: the background session's log is
+    // created here, and the publisher only learns the id from the registry on
+    // its next beat.
+    const { reservation } = await reserveNewSession(String(sessionId))
     let detached: Awaited<ReturnType<typeof deps.createDetached>>
     try {
       deps.owner.assertActive()
@@ -189,15 +194,19 @@ export function createAgentViewProjection(
         ...(composed.setup === undefined ? {} : { setup: composed.setup }),
       }))
     } catch (error) {
+      reservation.abandon()
       const message = error instanceof Error ? error.message : String(error)
       deps.notify(t('agentview-dispatch-failed', { err: message }), { color: 'error', timeoutMs: 8000 })
       return { ok: false, reason: 'failed', error: message }
     }
-    if (!deps.owner.current()) { await detached.release(); return { ok: false, reason: 'failed', error: 'Channel lifetime ended' } }
+    if (!deps.owner.current()) { await detached.release(); reservation.abandon(); return { ok: false, reason: 'failed', error: 'Channel lifetime ended' } }
     try { await attachSessionToWorkspace(ctx, deps.cwd(), sessionId) } catch { /* optional ledger */ }
-    if (!deps.owner.current()) { await detached.release(); return { ok: false, reason: 'failed', error: 'Channel lifetime ended' } }
+    if (!deps.owner.current()) { await detached.release(); reservation.abandon(); return { ok: false, reason: 'failed', error: 'Channel lifetime ended' } }
     detached.transfer()
     backgroundHandles.set(String(sessionId), detached.handle)
+    // The session is this process's background handle from here on, so the
+    // reservation has done its job: the registry is the authority now.
+    reservation.settle()
     touchAgentViewSession(String(sessionId))
     touchSession(sessionId)
     // transfer intentionally moves disposal to the background ledger; check
@@ -236,12 +245,17 @@ export function createAgentViewProjection(
   }
   const attach = async (sessionId: string): Promise<ResumeResult> => {
     if (sessionId === String(deps.binding.agent.session.id)) return { ok: true }
+    const capture = deps.binding.capture()
+    // A retiring Agent can remain in the registry until its JSONL writer has
+    // drained. Read the live target only after that close, just like /resume.
+    await deps.binding.waitForDisposal(sessionId)
+    if (!deps.binding.isCurrent(capture)) return { ok: false, reason: 'cancelled' }
     // Capture the exact live target before the async host decision. If the
     // registry replaces it while parked, never silently adopt that arbitrary
     // replacement; a later user action can make a fresh, explicit choice.
     const live = agents()?.get(SessionId(sessionId))
     if (await deps.sessionSwitchVetoed('agent-view', sessionId)) return { ok: false, reason: 'cancelled' }
-    if (live !== undefined && agents()?.get(SessionId(sessionId)) !== live) return { ok: false, reason: 'cancelled' }
+    if (!deps.binding.isCurrent(capture) || agents()?.get(SessionId(sessionId)) !== live) return { ok: false, reason: 'cancelled' }
     return live === undefined ? deps.resumeInto(sessionId, 'agent-view', true) : deps.adoptLive(live)
   }
   const peek = async (sessionId: string): Promise<PreviewEntry[]> => {

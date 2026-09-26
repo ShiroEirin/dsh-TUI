@@ -8,6 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
 import { Config } from './index.js'
+import { configValues, createSettingsScope, resolveSettingsNamespace, type RuntimeConfig } from './compat/settings.js'
 import { createChannel } from './channel.js'
 import { createChannelSceneOutlet } from './channel-scene-outlet.js'
 import { mountChannelUi } from './channel-ui.js'
@@ -31,12 +32,14 @@ import { migratePresetPref, readPresetPref } from '../presetPrefs.js'
 import { readEffortPref } from '../effortPrefs.js'
 import { composePreset, filterMinimalPresetTools, resolvePersistedPreset, resolvePersistedRoute, runningPresetOf } from './presets.js'
 import { ensurePackagedPresets } from './packaged-presets.js'
+import { registerBundledPresets } from './bundled-presets.js'
 import { ensureLegacySessionEventTypes, snapshotLiveSessionEvents } from './compat/index.js'
 import { clearResumeTarget, resumeTargetFromArgv, writeResumeTarget } from '../sessionHistory.js'
+import { readHomePrefs } from '../homePrefs.js'
 import { resolveSessionCwd } from '../utils/workspaceRoot.js'
 import { beginRestartAttempt, checkForTuiUpdate, installedTuiVersion, isBootDeadlockTarget, isStandaloneRuntime, isVersionNewer, logRestartEvent, resolveDshProfileName, resolveTuiUpdateTarget, restartTui, updateTuiAndRestart, writeHandoffNotice } from '../update.js'
 import { getLang, isLang, resolveStartupLang, setLang, t, writeLangPref } from '../i18n.js'
-import { DEFAULT_PAGE_MARGIN, DEFAULT_STATUS_BAR, applyPageMargin, isPageMarginMode, normalizePageMargin, normalizeScrollGutter, normalizeStatusBar, normalizeToolBackground, parsePageMarginSpec, type PageMarginSetting, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
+import { DEFAULT_PAGE_MARGIN, DEFAULT_STATUS_BAR, applyMermaidDiagrams, applyPageMargin, isPageMarginMode, normalizePageMargin, normalizeScrollGutter, normalizeStatusBar, normalizeToolBackground, parsePageMarginSpec, type PageMarginSetting, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
 import {
   draftComboConflicts,
   effectiveComboString,
@@ -49,6 +52,8 @@ import { attachHerdrIntegration } from '../herdr.js'
 import { logMouseDebug } from '../utils/debug.js'
 import { Chat } from '../screens/Chat.js'
 import { openInjectChannel, type InjectController } from './inject-channel.js'
+import { startSessionMountHeartbeat } from './session-mount-heartbeat.js'
+import { reserveMount } from '../sessionMounts.js'
 import { getHostDialogStore, type TuiDialogRuntime } from './dialogs.js'
 import { getHostStatusStore, type TuiStatusRuntime } from './status.js'
 import { getHostToastStore, type TuiToastRuntime } from './toast.js'
@@ -139,7 +144,8 @@ export function resolveTuiHostMode(
   return explicitTuiLaunch ? 'invalid-explicit-launch' : 'headless-host'
 }
 
-export async function apply(ctx: Context, config: Config): Promise<void> {
+export async function apply(ctx: Context, runtimeConfig: RuntimeConfig<Config>, configOwner: Context = ctx): Promise<void> {
+  const config = configValues<Config>(runtimeConfig)
   // /restart handoff diagnosis: the replacement process is marked by env and
   // logs its boot progress to ~/.dsh-tui/restart.log (ordinary launches stay
   // silent). First line lands before anything in this function can throw.
@@ -214,11 +220,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return
   }
 
-  // The official profile launcher owns the system preset root and replaces
-  // any bundle-supplied roots at boot. Install dsh-tui's bundled presets via
-  // the roster's supported user-root seam before resolving the first agent.
-  // Never overwrite an existing directory unless it carries our marker.
-  try {
+  // Validate settings before creating an agent or taking over the terminal.
+  const tuiSettingsNs = resolveSettingsNamespace(configOwner, Config) as SettingsNamespace
+
+  // Modern hosts own a declarative registry; old hosts discover directories.
+  // A modern bundle failure must not silently fall back to obsolete files.
+  if (!await registerBundledPresets(ctx)) try {
     for (const result of ensurePackagedPresets()) {
       if (result.status === 'conflict') {
         ctx.logger.warn(
@@ -462,6 +469,14 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // Opening a persisted TUI session is an explicit ownership action too.
     // Older TUI versions only wrote the Session log, so attaching on every
     // startup repairs those durable-but-ungrouped sessions idempotently.
+    //
+    // This is ALSO how a workspace enters the rail: `resolveByPath(cwd) ??
+    // create(cwd)` mints the durable record for the directory this terminal
+    // was launched in, so the session screen lists every directory a TUI has
+    // ever started in. The ledger is DSH's own workspace store, so the Web UI
+    // reads the same records. There is deliberately no rail-side "add a
+    // workspace" control any more: a terminal's launch directory is the whole
+    // registration story.
     const attached = await attachSessionToWorkspace(ctx, meta.cwd, agent.session.id)
     if (!attached) {
       ctx.logger.warn(
@@ -554,8 +569,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // Root page-margin store: the PageMargin inset box sits ABOVE Chat, so
   // the channel version bump (which re-renders everything below Chat)
   // cannot drive it. Seed the store from config before the tree mounts;
-  // applyDisplay below mirrors every settings change into it live.
+  // applyDisplay below mirrors every settings change into it live. The
+  // mermaid switch rides the same kind of store (Markdown is memoized by
+  // content, so no prop reaches the diagram component).
   applyPageMargin(config.pageMargin)
+  applyMermaidDiagrams(config.mermaidDiagrams)
   // Plugin toasts ride the channel's own notification surface: the runtime
   // already sanitized/rate-limited the delivery, the sink only forwards.
   // Without the extensions row (tuiToast absent) plugin toasts are dropped
@@ -593,18 +611,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     resolveSettingsReady = () => resolve()
     setTimeout(resolve, 300)
   })
-  // Register the dsh-tui settings namespace so the /settings screen can
-  // edit it (the section below was '命名空间未注册' without this): the
-  // user layer in settings.yaml wins over cordis.yml's diffLayout, and
-  // watch() lands commits on the live channel — no recompose needed.
+  // Old hosts register a settings.yaml scope. 0.1.7 projects the plugin's
+  // volatile Config fields instead; both paths apply edits without remounting.
   ctx.inject(['settings'], (settingsCtx) => {
-    // alpha.2 removed the `settingsNamespace()` brand helper: register() now
-    // takes the raw string and validates it itself, while rc.2 still wants the
-    // branded handle. Brands are type-only, so the constant cast compiles
-    // against both lines and the runtime value is identical ('dsh-tui' always
-    // satisfied the namespace pattern).
-    const tuiSettingsNs = 'dsh-tui' as SettingsNamespace
-    const scope = settingsCtx.settings.register(
+    // Loader targets the Config owner's fiber, not the injected child fiber.
+    const scope = createSettingsScope<SettingsValue>(configOwner, settingsCtx.settings,
       tuiSettingsNs,
       Schema.object({
         diffLayout: Schema.union(['auto', 'split', 'unified']).default('auto'),
@@ -632,6 +643,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         expandEditor: Schema.boolean(),
         // Same no-default rule: applyDisplay resolves `?? config.smoothStreaming ?? true`.
         smoothStreaming: Schema.boolean(),
+        // Same no-default rule: applyDisplay resolves `?? config.mermaidDiagrams ?? true`.
+        mermaidDiagrams: Schema.boolean(),
         // No default on purpose: unset keeps the boot chain decisive
         // (applyEffortDefault hands `undefined` to channel.setDefaultEffort,
         // which resolves cordis.yml `effort` → effort.json → adapter default).
@@ -680,6 +693,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           Object.fromEntries(SHORTCUT_ACTIONS.map(action => [action.id, Schema.string().required(false)])),
         ).required(false),
       }),
+      () => {
+        const current = configValues<Config>(runtimeConfig)
+        return { ...current, lang: isLang(current.lang) ? current.lang : undefined }
+      },
     )
     type SettingsValue = {
       diffLayout?: 'auto' | 'split' | 'unified'
@@ -698,6 +715,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       promptSessionLabel?: boolean
       expandEditor?: boolean
       smoothStreaming?: boolean
+      mermaidDiagrams?: boolean
       statusBar?: Partial<StatusBarConfig>
       shortcuts?: Partial<Record<ShortcutActionId, string>>
     }
@@ -752,15 +770,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       channel.setPromptSessionLabel(value.promptSessionLabel ?? config.promptSessionLabel ?? false)
       channel.setExpandEditor(value.expandEditor ?? config.expandEditor ?? true)
       channel.setSmoothStreaming(value.smoothStreaming ?? config.smoothStreaming ?? true)
+      applyMermaidDiagrams(value.mermaidDiagrams ?? config.mermaidDiagrams)
       channel.setStatusBar(normalizeStatusBar(value.statusBar ?? config.statusBar))
     }
-    // Shortcut overrides resolve per action: settings user layer wins over
-    // cordis.yml's `shortcuts` (same precedence as every other field);
-    // unset everywhere keeps the registry default. Applied live into the
-    // keymap module — the very next keypress matches the new combos.
+    // Legacy user scopes layer over cordis.yml. Modern Config is already
+    // resolved: an unset action must not revive its startup override.
+    // Applied live so the very next keypress matches the new combos.
     const applyShortcuts = (value: SettingsValue): void => {
       const userLayer = value.shortcuts ?? {}
-      const configLayer = config.shortcuts ?? {}
+      const configLayer = scope.legacy ? config.shortcuts ?? {} : {}
       const merged: Partial<Record<ShortcutActionId, string>> = {}
       for (const action of SHORTCUT_ACTIONS) {
         const user = userLayer[action.id]
@@ -807,7 +825,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     // not an explicit undefined), and the later watch commit (fullscreen
     // back to undefined) leaves the fullscreen decision unchanged.
     const bootSettings = scope.get()
-    const fullscreenMigration = planFullscreenFactoryMigration(bootSettings.fullscreen, readAppliedMigrations())
+    // The old migration applies only to the separate user layer. A modern
+    // profile's explicit inline Config must never be mistaken for that layer.
+    const fullscreenMigration = scope.legacy
+      ? planFullscreenFactoryMigration(bootSettings.fullscreen, readAppliedMigrations())
+      : 'done'
     void commitFullscreenFactoryMigration(fullscreenMigration, {
       unset: () => settingsCtx.settings.mutate(tuiSettingsNs, [{ op: 'unset', path: ['fullscreen'] }]),
     })
@@ -817,7 +839,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const { fullscreen: staleFullscreen, ...migratedSettings } = bootSettings
     apply(fullscreenMigration === 'unset' ? migratedSettings : bootSettings)
     let lastTerminalImages = bootSettings.terminalImages ?? config.terminalImages ?? true
-    scope.watch(next => {
+    settingsCtx.effect(() => scope.watch(next => {
       apply(next)
       if (typeof next.fullscreen === 'boolean' && next.fullscreen !== bootedFullscreen) {
         notifyChannel(t('settings-fullscreen-restart'), { color: 'warning' })
@@ -827,7 +849,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         channel.notify(t('settings-terminal-images-restart'), { color: 'warning' })
       }
       lastTerminalImages = terminalImages
-    })
+    }))
     resolveSettingsReady?.()
   })
   // The /settings screen's own section: the dsh-tui namespace comes from
@@ -900,6 +922,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       hintEn: d => `Fold/unfold the goal/todo panel. Default: ${d}.`,
       hintZh: d => `折叠/展开目标与待办面板。默认 ${d}。`,
     },
+    questionFold: {
+      label: 'Question panel fold shortcut',
+      zh: '提问面板折叠快捷键',
+      hintEn: d => `Fold/unfold the pending question panel. Default: ${d}.`,
+      hintZh: d => `折叠/展开等待回答的提问面板。默认 ${d}。`,
+    },
     expandEditor: {
       label: 'Fullscreen editor shortcut',
       zh: '全屏草稿编辑快捷键',
@@ -941,7 +969,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       ctx.get('tuiSettingsSections') as TuiSettingsSectionsRuntime | undefined,
     ) ?? getLocalSettingsSectionsHost(ctx)
     const unregister = settingsSections.register({
-      ns: 'dsh-tui',
+      ns: tuiSettingsNs,
       title: 'dsh-tui',
       groups: [
         { id: 'status-bar', title: 'Status bar', descriptions: { zh: '底栏设置' } },
@@ -1120,6 +1148,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           format(value: unknown): string {
             // Unset in settings.yaml: the effective default is on.
             return String(typeof value === 'boolean' ? value : config.smoothStreaming !== false)
+          },
+        },
+        {
+          path: ['mermaidDiagrams'],
+          label: 'Mermaid diagrams',
+          descriptions: { zh: 'Mermaid 图表' },
+          hint: 'Render ```mermaid fences in replies as box-drawing diagrams (flowchart, sequence, state, class, ER, pie, mindmap, timeline, gitGraph). Diagrams wider than the terminal, or of an unsupported type, keep the fenced source. Applies immediately. On by default.',
+          hintDescriptions: { zh: '把回复中的 ```mermaid 代码块画成字符图（flowchart、sequence、state、class、ER、pie、mindmap、timeline、gitGraph）。比终端宽或类型不支持的图保留源码。立即生效。默认开启。' },
+          kind: 'boolean',
+          format(value: unknown): string {
+            // Unset in settings.yaml: the effective default is on.
+            return String(typeof value === 'boolean' ? value : config.mermaidDiagrams !== false)
           },
         },
         {
@@ -1539,12 +1579,28 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // BEFORE creating Chat: the element must see the same bootedFullscreen the
   // root tree resolves after settingsReady below.
   await settingsReady
+  /**
+   * One-shot workspace-home landing.
+   *
+   * Only an ORDINARY launch is eligible: an explicit resume (`--resume` /
+   * `-c` / the launcher's remembered target), an explicit workspace target, and
+   * a first prompt all mean the user already said where they want to be, and
+   * covering that with a browser would be the TUI second-guessing them. The
+   * `seen` marker is written when the screen is dismissed (see `closeHome`),
+   * so a process that dies before the first frame does not consume it.
+   */
+  const homeSeen = readHomePrefs().seen === true
+  const openHomeOnBoot = !homeSeen
+    && launchSessionId === undefined
+    && requestedWorkspace === undefined
+    && initialPromptFromCmdlineArgs(process.argv.slice(2)) === ''
   const chat = React.createElement(Chat, {
     channel,
     renderScene: createChannelSceneOutlet(() => rawChannel.pluginScene),
     questionStore,
     approvalStore,
     injectControllerRef,
+    openHomeOnBoot,
     // The dsh-tui-extensions row's services (managed dialogs, status line,
     // shortcuts). Soft-consumed: absent the row (stale patch, bare embed),
     // Chat falls back to inert stores and no shortcut registry.
@@ -1667,6 +1723,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     ctx.effect(() => () => injectChannel.close())
   }
 
+  // Cross-process session mounting: publish the sessions this process has
+  // mounted so another TUI (a different terminal process on the same machine)
+  // can see them as occupied and refuse to mount the same log. Two processes
+  // driving one session would interleave writes into a single append-only
+  // transcript, so this is the guard that makes multi-process TUI use safe.
+  // Registered on the same teardown funnel as everything else: the disposer
+  // stops the heartbeat and removes the claim, so a clean exit frees its
+  // sessions at once while a killed process is reclaimed by liveness.
+  ctx.effect(() => startSessionMountHeartbeat(ctx))
+
   // Check in the background so registry latency never delays the first frame.
   // A failed/offline check is intentionally silent; the manual `/update`
   // command remains available regardless of network access.
@@ -1751,6 +1817,46 @@ async function resolveAgent(
     if (existing !== undefined) {
       return { agent: existing, agentPreset: runningPresetOf(existing.session) }
     }
+    // The launch-time counterpart of the in-session `/resume` claim
+    // (`channel/session-resume.ts`), and it has to happen before ANY await:
+    // without it `dsh-tui --resume <id>` mounts the log purely because the user
+    // asked for it, so a second terminal doing the same joins the first and
+    // both interleave writes into one append-only transcript. The mount
+    // publisher cannot cover this — it publishes the set, it never refuses a
+    // mount — so the claim is the only place the refusal can come from.
+    //
+    // Every failure refuses. "The ledger was busy" and "the ledger could not be
+    // read" are not evidence that the session is free, and a boot that guesses
+    // the wrong way here interleaves two writers into one append-only log —
+    // the one outcome nothing downstream can repair. A genuinely read-only home
+    // therefore costs a `--resume` refusal, which is loud and fixable, instead
+    // of silent corruption.
+    const reserved = await reserveMount(requestedSessionId)
+    if (!reserved.ok) {
+      if (reserved.reason === 'occupied') {
+        throw new Error(
+          `dsh-tui: cannot resume session "${requestedSessionId}": it is mounted by another TUI terminal ` +
+          `(pid ${reserved.holders[0] ?? 0}) — two processes driving one session log would corrupt it. ` +
+          'Close that terminal, or drop --resume to start a fresh session.',
+        )
+      }
+      if (reserved.reason === 'busy') {
+        throw new Error(
+          `dsh-tui: cannot resume session "${requestedSessionId}": another process is holding the ` +
+          'session mount ledger right now, so its occupancy could not be checked. Retry in a moment.',
+        )
+      }
+      throw new Error(
+        `dsh-tui: cannot resume session "${requestedSessionId}": its occupancy could not be verified ` +
+        `(${reserved.detail}). Refusing rather than risk two processes writing one session log. ` +
+        'If that file is damaged, remove it (and the matching .lock) while no other TUI is running, ' +
+        'or drop --resume to start a fresh session.',
+      )
+    }
+    // The reservation spans the awaits below: the agent only appears in the
+    // registry once `agents.resume` returns, and a publisher beat landing in
+    // between would otherwise drop the claim this boot just committed.
+    const reservation = reserved.reservation
     try {
       // Compat boundary: register vouched-for legacy event types before the
       // strict read path (issue #153) — same seam as the /resume picker,
@@ -1782,6 +1888,9 @@ async function resolveAgent(
         route: resumeRoute ?? recordedModelRoute(snapshotLiveSessionEvents(resumed.agent.session)),
       }
     } catch (error) {
+      // A claim says "this process is driving the log". A resume that never
+      // mounted must not leave one behind for a peer to see and refuse.
+      reservation.abandon()
       // A launch-time --resume is an explicit request: silently substituting a
       // fresh session presents a cold conversation as the resumed one (the
       // "resume did nothing" failure mode — the warn below never reached a
@@ -1794,6 +1903,10 @@ async function resolveAgent(
         'Drop --resume to start fresh, or repair the session log first.',
         { cause: error },
       )
+    } finally {
+      // The reservation only has to outlive the mount. From here the agent is
+      // in the registry, which is what the publisher derives the set from.
+      reservation.settle()
     }
   }
   const sessionId = SessionId(randomUUID())
@@ -1818,16 +1931,31 @@ async function resolveAgent(
       `dsh-tui: model route ${rejected.provider}/${rejected.model} is not advertised by provider "${rejected.provider}"; falling back to ${route.provider}/${route.model}`,
     )
   }
-  const created = await ctx.agents.create({
-    sessionId,
-    meta: {
-      ...meta,
-      // Durable header value: a later resume re-mounts exactly this preset.
-      ...(composed.agentPreset === undefined ? {} : { agentPreset: composed.agentPreset }),
-    },
-    agentOptions: route,
-    ...(composed.setup === undefined ? {} : { setup: composed.setup }),
-  }).catch((error: unknown) => {
+  // Reserve the fresh id before the factory, exactly like the in-session
+  // creates: from the moment `agents.create` returns this process holds the
+  // only write handle on a log the publisher has not named yet. A brand-new id
+  // cannot conflict, so a refusal is only warned about — it costs
+  // announcement, not correctness — but the reservation is what keeps the gap
+  // between the create and the next beat from being open.
+  const bootReserved = await reserveMount(String(sessionId))
+  if (!bootReserved.ok && bootReserved.reason !== 'occupied') {
+    ctx.logger.warn(`dsh-tui: could not announce the new session in the mount ledger: ${bootReserved.reason}`)
+  }
+  const bootReservation = bootReserved.ok ? bootReserved.reservation : undefined
+  let created: Awaited<ReturnType<typeof ctx.agents.create>>
+  try {
+    created = await ctx.agents.create({
+      sessionId,
+      meta: {
+        ...meta,
+        // Durable header value: a later resume re-mounts exactly this preset.
+        ...(composed.agentPreset === undefined ? {} : { agentPreset: composed.agentPreset }),
+      },
+      agentOptions: route,
+      ...(composed.setup === undefined ? {} : { setup: composed.setup }),
+    })
+  } catch (error: unknown) {
+    bootReservation?.abandon()
     // Fail loud with the reason on stderr — a dead TUI with no message is
     // the worst outcome for a misconfigured leaf (unknown provider/model).
     const message = error instanceof Error ? error.message : String(error)
@@ -1835,7 +1963,8 @@ async function resolveAgent(
       `dsh-tui: failed to create agent (provider=${route.provider}, model=${route.model}): ${message}`,
       { cause: error },
     )
-  })
+  }
+  bootReservation?.settle()
   return { agent: created.agent, handle: created, agentPreset: composed.agentPreset, route }
 }
 
@@ -2127,6 +2256,13 @@ function runUpdate(
       },
     )
   })
+}
+
+/** Deferred runtime failures must restore the terminal and fail the process. */
+export function handleStartupError(ctx: Context, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error)
+  void finishExit(ctx, undefined, lastBootedFullscreen ?? true, undefined,
+    `dsh-tui startup failed: ${message}`, () => disposeRootAndExit(ctx, 1))
 }
 
 /**
